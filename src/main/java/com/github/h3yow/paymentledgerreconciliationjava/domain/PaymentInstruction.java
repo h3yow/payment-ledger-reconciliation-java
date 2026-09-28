@@ -17,18 +17,27 @@ public final class PaymentInstruction {
     private final String payeeAccountNo;
     private final Money amount;
     private final Instant createdAt;
+    /** 手续费结算快照；无手续费的支付为 null。受理当时锁定，永不随费率配置变化。 */
+    private final FeeSettlement feeSettlement;
     private PaymentStatus status;
     private Instant finishedAt;
     private String failReason;
 
     public PaymentInstruction(String id, String businessId, String payerAccountNo,
                               String payeeAccountNo, Money amount, Instant createdAt) {
+        this(id, businessId, payerAccountNo, payeeAccountNo, amount, createdAt, null);
+    }
+
+    public PaymentInstruction(String id, String businessId, String payerAccountNo,
+                              String payeeAccountNo, Money amount, Instant createdAt,
+                              FeeSettlement feeSettlement) {
         this.id = Objects.requireNonNull(id);
         this.businessId = Objects.requireNonNull(businessId);
         this.payerAccountNo = Objects.requireNonNull(payerAccountNo);
         this.payeeAccountNo = payeeAccountNo;
         this.amount = Objects.requireNonNull(amount);
         this.createdAt = Objects.requireNonNull(createdAt);
+        this.feeSettlement = feeSettlement;
         this.status = PaymentStatus.ACCEPTED;
     }
 
@@ -50,6 +59,11 @@ public final class PaymentInstruction {
 
     public Money getAmount() {
         return amount;
+    }
+
+    /** 手续费结算快照；无手续费时为 null。 */
+    public FeeSettlement getFeeSettlement() {
+        return feeSettlement;
     }
 
     public Instant getCreatedAt() {

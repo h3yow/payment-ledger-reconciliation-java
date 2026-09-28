@@ -38,6 +38,12 @@ public class GlobalExceptionHandler {
         return build(HttpStatus.CONFLICT, "STATUS_CONFLICT", ex.getMessage(), null);
     }
 
+    /** 支付存在但不含手续费要素：404 + FEE_SETTLEMENT_NOT_FOUND。 */
+    @ExceptionHandler(FeeSettlementNotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNoFee(FeeSettlementNotFoundException ex) {
+        return build(HttpStatus.NOT_FOUND, "FEE_SETTLEMENT_NOT_FOUND", ex.getMessage(), null);
+    }
+
     private ResponseEntity<Map<String, Object>> build(HttpStatus status, String code,
                                                       String reason, Map<String, Object> extra) {
         Map<String, Object> body = new LinkedHashMap<>();

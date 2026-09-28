@@ -65,6 +65,23 @@ public final class Money {
         return value.setScale(SCALE, RoundingMode.HALF_UP);
     }
 
+    /**
+     * 外部传入金额（{@code BigDecimal} 形态，如渠道结算总额/手续费/净额）的精度契约：
+     * 非空且小数位不超过 2 位才接受，并规范到 scale=2；超过 2 位小数一律拒绝，
+     * <b>绝不隐式舍入/吞精度</b>。与 {@link #of(String)} 对支付金额的口径完全一致，
+     * 保证受理、过账、对账全链路同一精度规则。
+     */
+    public static BigDecimal requireScale2(BigDecimal value, String field) {
+        if (value == null) {
+            throw new IllegalArgumentException(field + " 不能为空");
+        }
+        if (value.scale() > SCALE) {
+            throw new IllegalArgumentException(
+                    field + " 精度超过 2 位小数，拒绝隐式舍入: " + value.toPlainString());
+        }
+        return value.setScale(SCALE, RoundingMode.UNNECESSARY);
+    }
+
     /** 是否为正金额。 */
     @com.fasterxml.jackson.annotation.JsonIgnore
     public boolean isPositive() {

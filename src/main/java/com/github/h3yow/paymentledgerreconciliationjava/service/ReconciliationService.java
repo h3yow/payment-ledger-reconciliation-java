@@ -3,6 +3,8 @@ package com.github.h3yow.paymentledgerreconciliationjava.service;
 import com.github.h3yow.paymentledgerreconciliationjava.domain.ChannelSettlementRecord;
 import com.github.h3yow.paymentledgerreconciliationjava.domain.ChannelStatus;
 import com.github.h3yow.paymentledgerreconciliationjava.domain.DifferenceType;
+import com.github.h3yow.paymentledgerreconciliationjava.domain.FeeSettlement;
+import com.github.h3yow.paymentledgerreconciliationjava.domain.Money;
 import com.github.h3yow.paymentledgerreconciliationjava.domain.PaymentInstruction;
 import com.github.h3yow.paymentledgerreconciliationjava.domain.ReconciliationBatch;
 import com.github.h3yow.paymentledgerreconciliationjava.domain.ReconciliationResultItem;
@@ -23,15 +25,24 @@ import java.util.Optional;
 /**
  * 对账服务（纯本地：渠道数据由调用方以 {@link ChannelSettlementRecord} 列表传入，无任何外部调用）。
  *
- * <p>核对口径（对每个 businessId 恰好产出一条结论，五类互斥，差异不静默、不合并、不重复处理）：
+ * <p>核对口径（对每个 businessId 恰好产出一条结论，互斥，差异不静默、不合并、不重复处理）：
  * <ul>
  *   <li>{@code LOCAL_MISSING}：渠道有单，本地流水不存在；</li>
  *   <li>{@code CHANNEL_MISSING}：在本地核对范围内、本地有流水，但渠道无单；</li>
  *   <li>{@code STATUS_MISMATCH}：双方都有，但成功/失败口径不一致
  *       （本地 POSTED 对应渠道 SUCCESS；本地 FAILED 对应渠道 FAILED；ACCEPTED 视为未完成，与任何渠道状态都不一致）；</li>
- *   <li>{@code AMOUNT_MISMATCH}：状态一致但金额不一致（统一规范到 2 位小数后精确比较）；</li>
- *   <li>{@code MATCHED}：状态、金额均一致。</li>
+ *   <li>{@code AMOUNT_MISMATCH}：状态一致但总额不一致；</li>
+ *   <li>{@code NET_MISMATCH}：总额一致、状态一致，但扣费后净额双方不一致（依据中分别写明双方净额）；</li>
+ *   <li>{@code FEE_MISMATCH}：总额一致、状态一致，但手续费双方不一致（依据中分别写明双方手续费）；
+ *       净额与手续费分开识别，不混成一类；二者都不符时按“净额优先”报 NET_MISMATCH，依据仍列出手续费实际值；</li>
+ *   <li>{@code MATCHED}：状态一致；总额一致；当任一方携带手续费/净额要素时，净额与手续费也都一致。</li>
  * </ul>
+ *
+ * <p>向后兼容：渠道记录不带 fee/net（两者都为 null）时，行为与扩展前完全一致——
+ * 只比对总额与状态，不因本地有手续费快照而产生手续费类差异。
+ *
+ * <p>精度契约：渠道总额/手续费/净额一律要求最多 2 位小数，超精度直接 INVALID_PARAMETER 拒绝，
+ * 不做隐式舍入；因此不会把仅精度处理方式不同的金额判成一致。
  *
  * <p>批次口径：结果按 businessId 排序后落库，结论不可变；同一 batchId 携带相同输入重复执行，
  * 直接返回历史结论（历史可复现、不重复处理）；携带不同输入则以 STATUS_CONFLICT 拒绝。
@@ -116,9 +127,11 @@ public class ReconciliationService {
             return winner;
         }
 
-        log.info("对账完成: batchId={}, 总数={}, 一致={}, 差异={}（分类: 金额不符={}, 状态不一致={}, 本地缺失={}, 渠道缺失={}）",
+        log.info("对账完成: batchId={}, 总数={}, 一致={}, 差异={}（分类: 总额不符={}, 净额不符={}, 手续费不符={}, 状态不一致={}, 本地缺失={}, 渠道缺失={}）",
                 batch.batchId(), batch.totalCount(), batch.matchedCount(), batch.differenceCount(),
                 countOf(items, DifferenceType.AMOUNT_MISMATCH),
+                countOf(items, DifferenceType.NET_MISMATCH),
+                countOf(items, DifferenceType.FEE_MISMATCH),
                 countOf(items, DifferenceType.STATUS_MISMATCH),
                 countOf(items, DifferenceType.LOCAL_MISSING),
                 countOf(items, DifferenceType.CHANNEL_MISSING));
@@ -136,7 +149,7 @@ public class ReconciliationService {
                     "本地有流水、渠道缺单", basis);
         }
         if (local == null) {
-            String basis = "渠道状态=" + channel.status() + " 金额=" + normalize(channel.amount())
+            String basis = "渠道状态=" + channel.status() + " 金额=" + strictScale(channel.amount(), "渠道金额")
                     + "；本地无该 businessId 流水";
             return new ReconciliationResultItem(businessId, DifferenceType.LOCAL_MISSING,
                     "渠道有单、本地缺失", basis);
@@ -151,17 +164,52 @@ public class ReconciliationService {
         }
 
         BigDecimal localAmount = local.getAmount().amount();
-        BigDecimal channelAmount = normalize(channel.amount());
+        BigDecimal channelAmount = strictScale(channel.amount(), "渠道金额");
         if (localAmount.compareTo(channelAmount) != 0) {
-            String basis = "状态一致(" + channel.status() + ")；金额 本地="
+            String basis = "状态一致(" + channel.status() + ")；总额 本地="
                     + localAmount.toPlainString() + " 渠道=" + channelAmount.toPlainString();
             return new ReconciliationResultItem(businessId, DifferenceType.AMOUNT_MISMATCH,
-                    "金额不符: 本地 " + localAmount.toPlainString()
+                    "总额不符: 本地 " + localAmount.toPlainString()
                             + " / 渠道 " + channelAmount.toPlainString(), basis);
         }
 
+        // 总额一致后，只有渠道显式携带手续费/净额要素时才做分项核对（老请求口径不变）
+        if (channel.fee() != null || channel.netAmount() != null) {
+            FeeSettlement localFee = local.getFeeSettlement();
+            BigDecimal localFeeAmount = localFee == null
+                    ? BigDecimal.ZERO.setScale(Money.SCALE) : localFee.feeAmount();
+            BigDecimal localNet = localFee == null ? localAmount : localFee.netAmount();
+            BigDecimal channelFee = strictScale(channel.fee(), "渠道手续费");
+            BigDecimal channelNet = strictScale(channel.netAmount(), "渠道净额");
+
+            if (localNet.compareTo(channelNet) != 0) {
+                String basis = "状态一致(" + channel.status() + ") 且总额一致("
+                        + localAmount.toPlainString() + ")；净额 本地=" + localNet.toPlainString()
+                        + " 渠道=" + channelNet.toPlainString()
+                        + "；手续费实际值 本地=" + localFeeAmount.toPlainString()
+                        + " 渠道=" + channelFee.toPlainString();
+                return new ReconciliationResultItem(businessId, DifferenceType.NET_MISMATCH,
+                        "净额不符: 本地 " + localNet.toPlainString()
+                                + " / 渠道 " + channelNet.toPlainString(), basis);
+            }
+            if (localFeeAmount.compareTo(channelFee) != 0) {
+                String basis = "状态一致(" + channel.status() + ") 且总额一致("
+                        + localAmount.toPlainString() + ") 且净额一致(" + localNet.toPlainString()
+                        + ")；手续费 本地=" + localFeeAmount.toPlainString()
+                        + " 渠道=" + channelFee.toPlainString();
+                return new ReconciliationResultItem(businessId, DifferenceType.FEE_MISMATCH,
+                        "手续费不符: 本地 " + localFeeAmount.toPlainString()
+                                + " / 渠道 " + channelFee.toPlainString(), basis);
+            }
+
+            String basis = "状态一致(" + channel.status() + ") 且总额一致("
+                    + localAmount.toPlainString() + ")、净额一致(" + localNet.toPlainString()
+                    + ")、手续费一致(" + localFeeAmount.toPlainString() + ")";
+            return new ReconciliationResultItem(businessId, DifferenceType.MATCHED, "一致", basis);
+        }
+
         String basis = "状态一致(" + channel.status() + ") 且金额一致("
-                + localAmount.toPlainString() + ")";
+                + localAmount.toPlainString() + ")（渠道未提供手续费/净额，按总额口径核对）";
         return new ReconciliationResultItem(businessId, DifferenceType.MATCHED, "一致", basis);
     }
 
@@ -188,27 +236,59 @@ public class ReconciliationService {
             if (r == null || r.businessId() == null || r.businessId().isBlank()) {
                 throw new InvalidParameterException("渠道结算单 businessId 不能为空");
             }
-            if (r.amount() == null || normalize(r.amount()).signum() <= 0) {
+            // 全链路同一精度契约：外部金额超 2 位小数直接拒绝，原因按字段区分，绝不隐式舍入
+            BigDecimal amount = strictScale(r.amount(), "渠道金额");
+            if (amount.signum() <= 0) {
                 throw new InvalidParameterException("渠道结算单金额必须为正: " + r.businessId());
             }
             if (r.status() == null) {
                 throw new InvalidParameterException("渠道结算单状态不能为空: " + r.businessId());
             }
+            boolean feePresent = r.fee() != null;
+            boolean netPresent = r.netAmount() != null;
+            if (feePresent != netPresent) {
+                throw new InvalidParameterException(
+                        "渠道手续费与净额必须同时提供或同时省略: " + r.businessId());
+            }
+            if (feePresent) {
+                BigDecimal fee = strictScale(r.fee(), "渠道手续费");
+                BigDecimal net = strictScale(r.netAmount(), "渠道净额");
+                if (fee.signum() < 0) {
+                    throw new InvalidParameterException(
+                            "渠道手续费不能为负: " + r.businessId());
+                }
+                if (net.signum() <= 0) {
+                    throw new InvalidParameterException(
+                            "渠道净额必须为正: " + r.businessId());
+                }
+            }
         }
     }
 
-    private BigDecimal normalize(BigDecimal amount) {
-        return com.github.h3yow.paymentledgerreconciliationjava.domain.Money.round2(amount);
+    /** 外部金额严格精度校验（超 2 位小数抛出带字段名的参数非法），通过则规范到 scale=2。 */
+    private BigDecimal strictScale(BigDecimal value, String field) {
+        try {
+            return Money.requireScale2(value, field);
+        } catch (IllegalArgumentException e) {
+            throw new InvalidParameterException(e.getMessage());
+        }
     }
 
-    /** 输入指纹：渠道记录 + 范围，排序后拼接，保证同输入同指纹、不同输入可区分。 */
+    /** 输入指纹：渠道记录（含手续费/净额）+ 范围，排序后拼接，保证同输入同指纹、不同输入可区分。 */
     private String fingerprint(ReconciliationCommand command) {
         StringBuilder sb = new StringBuilder("CH[");
         command.channelRecords().stream()
                 .sorted(Comparator.comparing(ChannelSettlementRecord::businessId))
-                .forEach(r -> sb.append(r.businessId()).append('=')
-                        .append(normalize(r.amount()).toPlainString()).append('/')
-                        .append(r.status()).append(';'));
+                .forEach(r -> {
+                    sb.append(r.businessId()).append('=')
+                            .append(strictScale(r.amount(), "渠道金额").toPlainString()).append('/')
+                            .append(r.status());
+                    if (r.fee() != null || r.netAmount() != null) {
+                        sb.append("/fee=").append(strictScale(r.fee(), "渠道手续费").toPlainString())
+                                .append("/net=").append(strictScale(r.netAmount(), "渠道净额").toPlainString());
+                    }
+                    sb.append(';');
+                });
         sb.append("]SCOPE[");
         if (command.scopeBusinessIds() != null) {
             command.scopeBusinessIds().stream().sorted().forEach(k -> sb.append(k).append(','));
