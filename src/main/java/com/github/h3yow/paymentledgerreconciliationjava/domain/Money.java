@@ -10,7 +10,10 @@ import java.util.Objects;
  *   <li>记账精度：小数点后 2 位（分），内部 BigDecimal scale 固定为 2；</li>
  *   <li>舍入规则：HALF_UP（四舍五入，逢五进位），仅在显式调用 {@link #round2(BigDecimal)}
  *       （如费用拆分等计算场景）时使用；</li>
- *   <li>外部输入（支付金额）若超过 2 位小数，直接判定为非法参数，绝不隐式截断或吞掉精度；</li>
+ *   <li>外部输入（支付金额、渠道金额等一切外部金额）若<b>真实精度</b>超过 2 位小数，
+ *       直接判定为非法参数，绝不隐式截断或吞掉精度。真实精度按去尾零后的数值判断：
+ *       {@code 9.970} 与 {@code 9.97} 是同一数值（尾随零的不同写法），接受；
+ *       {@code 9.971} 带分位以外的小数，拒绝；</li>
  *   <li>金额本身允许为负的场景由业务层校验，本类型只保证精度与比较口径稳定。</li>
  * </ul>
  */
@@ -26,8 +29,10 @@ public final class Money {
     }
 
     /**
-     * 由十进制字符串构造金额。要求：非空、可解析、小数位不超过 2 位；
-     * 不满足时不做任何猜测，抛出 IllegalArgumentException 由服务层转为参数非法拒绝。
+     * 由十进制字符串构造金额。要求：非空、可解析、真实小数位不超过 2 位；
+     * 尾随零写法（如 {@code 9.970}）与规范写法等价并接受，真正带分位以下小数（如
+     * {@code 9.971}）拒绝。不满足时不做任何猜测，抛出 IllegalArgumentException
+     * 由服务层转为参数非法拒绝。
      */
     public static Money of(String raw) {
         if (raw == null || raw.isBlank()) {
@@ -39,9 +44,9 @@ public final class Money {
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException("金额格式非法: " + raw);
         }
-        if (parsed.scale() > SCALE) {
-            // 禁止隐式丢精度：3 位及以上小数必须由调用方显式按口径处理
-            throw new IllegalArgumentException("金额精度超过 2 位小数，拒绝隐式舍入: " + raw);
+        if (parsed.stripTrailingZeros().scale() > SCALE) {
+            // 禁止隐式丢精度：真实精度 3 位及以上小数必须由调用方显式按口径处理
+            throw new IllegalArgumentException("金额真实精度超过 2 位小数，拒绝隐式舍入: " + raw);
         }
         return new Money(parsed.setScale(SCALE, RoundingMode.UNNECESSARY));
     }

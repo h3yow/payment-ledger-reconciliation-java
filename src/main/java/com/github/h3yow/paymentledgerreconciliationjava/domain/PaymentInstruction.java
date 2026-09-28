@@ -17,18 +17,27 @@ public final class PaymentInstruction {
     private final String payeeAccountNo;
     private final Money amount;
     private final Instant createdAt;
+    /** 受理当时锁定的手续费清算快照；null 表示无手续费的老口径支付。随指令不可变。 */
+    private final FeeSnapshot feeSnapshot;
     private PaymentStatus status;
     private Instant finishedAt;
     private String failReason;
 
     public PaymentInstruction(String id, String businessId, String payerAccountNo,
                               String payeeAccountNo, Money amount, Instant createdAt) {
+        this(id, businessId, payerAccountNo, payeeAccountNo, amount, createdAt, null);
+    }
+
+    public PaymentInstruction(String id, String businessId, String payerAccountNo,
+                              String payeeAccountNo, Money amount, Instant createdAt,
+                              FeeSnapshot feeSnapshot) {
         this.id = Objects.requireNonNull(id);
         this.businessId = Objects.requireNonNull(businessId);
         this.payerAccountNo = Objects.requireNonNull(payerAccountNo);
         this.payeeAccountNo = payeeAccountNo;
         this.amount = Objects.requireNonNull(amount);
         this.createdAt = Objects.requireNonNull(createdAt);
+        this.feeSnapshot = feeSnapshot;
         this.status = PaymentStatus.ACCEPTED;
     }
 
@@ -54,6 +63,21 @@ public final class PaymentInstruction {
 
     public Instant getCreatedAt() {
         return createdAt;
+    }
+
+    /** 手续费清算快照（费率、手续费账户、手续费、净额、原始费额、尾差）；无手续费时为 null。 */
+    public FeeSnapshot getFeeSnapshot() {
+        return feeSnapshot;
+    }
+
+    /** 到分净额：有手续费时取扣费后净额，否则净额即本金。 */
+    public Money getNetAmount() {
+        return feeSnapshot == null ? amount : feeSnapshot.netAmount();
+    }
+
+    /** 到分手续费：无手续费支付为 0.00。 */
+    public Money getFee() {
+        return feeSnapshot == null ? Money.of(java.math.BigDecimal.ZERO) : feeSnapshot.fee();
     }
 
     public PaymentStatus getStatus() {

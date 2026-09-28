@@ -37,6 +37,8 @@ public class LedgerService {
     public static final String ACCT_PAYER = "1001";
     /** 预置：收款方负债类账户（待结算款）。 */
     public static final String ACCT_PAYEE = "2001";
+    /** 预置：结算方手续费收入类账户（手续费净额结算的入账目标）。 */
+    public static final String ACCT_FEE = "4001";
 
     private final AccountRepository accountRepository;
     private final LedgerEntryRepository entryRepository;
@@ -62,8 +64,9 @@ public class LedgerService {
     private void seedAccounts() {
         createAccount(ACCT_PAYER, AccountType.ASSET, "付款方在途资金", BigDecimal.ZERO);
         createAccount(ACCT_PAYEE, AccountType.LIABILITY, "收款方待结算款", BigDecimal.ZERO);
-        log.info("账本账户预置完成: {}({}), {}({})", ACCT_PAYER, AccountType.ASSET,
-                ACCT_PAYEE, AccountType.LIABILITY);
+        createAccount(ACCT_FEE, AccountType.REVENUE, "结算方手续费收入", BigDecimal.ZERO);
+        log.info("账本账户预置完成: {}({}), {}({}), {}({})", ACCT_PAYER, AccountType.ASSET,
+                ACCT_PAYEE, AccountType.LIABILITY, ACCT_FEE, AccountType.REVENUE);
     }
 
     /** 供演示/测试显式开户；期初余额统一规范到 2 位小数。重复开户以状态冲突拒绝。 */
