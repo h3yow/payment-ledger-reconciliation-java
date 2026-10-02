@@ -10,7 +10,8 @@ import java.math.BigDecimal;
  *   <li>{@code feeAccountNo}：手续费收款账户；</li>
  *   <li>{@code feeAmount}：实际入账手续费，scale 固定 2（分），HALF_UP 处理到分；</li>
  *   <li>{@code rawFeeAmount}：未做分位处理前的理论手续费（可能带 2 位以上小数），用于解释尾差；</li>
- *   <li>{@code roundingAdjustment}：尾差 = 入账手续费 − 理论手续费（HALF_UP 后非负），
+ *   <li>{@code roundingAdjustment}：尾差 = 入账手续费 − 理论手续费，
+ *       HALF_UP 进位时为正、舍去时为负（例如理论手续费 0.004 处理到 0.00，尾差 -0.004），
  *       即“分位以外的小数去了哪里”；恒满足 {@code feeAmount = rawFeeAmount + roundingAdjustment}；</li>
  *   <li>{@code netAmount}：扣费后净额 = 支付总额 − 入账手续费，scale 固定 2。</li>
  * </ul>

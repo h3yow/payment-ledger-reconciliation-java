@@ -94,6 +94,49 @@ class FeeApiIntegrationTest {
     }
 
     @Test
+    @DisplayName("HTTP：带费率但手续费算成0.00的支付仍返回200快照（费率/0.00/净额=总额），不被当成404无手续费")
+    void zeroFeeRatePaymentStillExposesSettlement() throws Exception {
+        // 1.00 * 4bp = 0.0004 -> HALF_UP 0.00；快照必须保留，账务净额=总额
+        String body = objectMapper.writeValueAsString(Map.of(
+                "businessId", "API-FEE-ZERO",
+                "payerAccountNo", "1001",
+                "payeeAccountNo", "2001",
+                "amountText", "1.00",
+                "feeRateBp", 4,
+                "feeAccountNo", "3001"));
+        mockMvc.perform(post("/api/payments").contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("POSTED"))
+                .andExpect(jsonPath("$.feeSettlement.feeRateBp").value(4))
+                .andExpect(jsonPath("$.feeSettlement.feeAmount").value(0.00))
+                .andExpect(jsonPath("$.feeSettlement.netAmount").value(1.00))
+                .andExpect(jsonPath("$.feeSettlement.roundingAdjustment").value(-0.0004));
+
+        // 单独查询手续费快照：存在且 200（区别于无手续费支付的 404）
+        mockMvc.perform(get("/api/payments/API-FEE-ZERO/fee-settlement"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.feeRateBp").value(4))
+                .andExpect(jsonPath("$.feeAmount").value(0.00))
+                .andExpect(jsonPath("$.netAmount").value(1.00));
+
+        // 这笔只有两行分录，手续费账户 3001 不出现在凭证里
+        String entries = mockMvc.perform(get("/api/ledger/entries"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        com.fasterxml.jackson.databind.JsonNode nodes = objectMapper.readTree(entries);
+        int voucherLines = 0;
+        for (com.fasterxml.jackson.databind.JsonNode node : nodes) {
+            if ("API-FEE-ZERO".equals(node.get("voucherNo").asText())) {
+                voucherLines++;
+                org.junit.jupiter.api.Assertions.assertNotEquals(
+                        "3001", node.get("accountCode").asText(),
+                        "0.00 手续费不得在手续费账户产生分录行");
+            }
+        }
+        org.junit.jupiter.api.Assertions.assertEquals(2, voucherLines, "按净额=总额两行凭证入账");
+        log.info("[HTTP 0.00 手续费留痕] API-FEE-ZERO 快照 200 可查（4bp/0.00/1.00，尾差 -0.0004），两行分录无 3001");
+    }
+
+    @Test
     @DisplayName("HTTP：费率配置可查询/修改；修改只影响之后受理；净额/手续费分项对账识别差异")
     void endToEndConfigChangeAndFeeReconciliation() throws Exception {
         // 用配置驱动：开启 60bp

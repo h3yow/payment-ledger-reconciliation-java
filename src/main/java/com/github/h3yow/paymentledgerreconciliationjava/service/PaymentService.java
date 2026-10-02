@@ -35,9 +35,10 @@ import java.util.concurrent.ConcurrentMap;
  *   <li>已存在分支按内容区分：内容完全相同（含费率/手续费账户）→ {@link DuplicateRequestException}，
  *       内容不同 → {@link ConflictException}；二者错误原因可区分；</li>
  *   <li>赢家紧接着调用 {@link LedgerService#postVoucher} 过账：
- *       无手续费两行凭证；带手续费三行凭证（借付款方总额；贷收款方净额；贷手续费账户手续费），
- *       成功标记 POSTED；失败（含中途故障）由账本保证余额全额冲正、无分录残留，
- *       指令标记 FAILED（终态），同一 businessId 不可再提，需换新业务键。</li>
+ *       无手续费两行凭证；手续费为正三行凭证（借付款方总额；贷收款方净额；贷手续费账户手续费），
+ *       费率生效但入账手续费为 0.00 时账务上仍按两行凭证（净额=总额，不产生 0 金额分录行），
+ *       但费率/0.00 手续费/净额快照照常保留在指令上。成功标记 POSTED；失败（含中途故障）
+ *       由账本保证余额全额冲正、无分录残留，指令标记 FAILED（终态），同一 businessId 不可再提，需换新业务键。</li>
  * </ol>
  *
  * <p>费率快照：每笔支付实际使用的费率、手续费账户、理论/入账手续费、尾差与净额
@@ -101,7 +102,10 @@ public class PaymentService {
             }
 
             // 3. 赢家过账（凭证号复用 businessId，天然一一对应）
-            List<LedgerService.VoucherLine> lines = fee == null
+            // 费率生效但入账手续费为 0.00 时：快照留痕保留，账务上按净额=总额走两行凭证，
+            // 不产生 0 金额分录行（账本禁止借贷同时为零的分录行）；手续费为正才记三行凭证。
+            boolean zeroPostedFee = fee != null && fee.settlement().feeAmount().signum() == 0;
+            List<LedgerService.VoucherLine> lines = (fee == null || zeroPostedFee)
                     ? List.of(
                             new LedgerService.VoucherLine(payer, amount.amount(), BigDecimal.ZERO),
                             new LedgerService.VoucherLine(payee, BigDecimal.ZERO, amount.amount()))
@@ -179,14 +183,13 @@ public class PaymentService {
         BigDecimal rawFee = gross.multiply(BigDecimal.valueOf(effectiveRateBp))
                 .divide(BigDecimal.valueOf(10_000L), java.math.MathContext.DECIMAL128)
                 .stripTrailingZeros();
-        // 固定分位规则：HALF_UP 处理到分；尾差 = 入账手续费 − 理论手续费（HALF_UP 下非负），
+        // 固定分位规则：HALF_UP 处理到分；尾差 = 入账手续费 − 理论手续费，可正（进位）可负（舍去），
         // 尾差保留精确小数值，使“入账手续费 = 理论手续费 + 尾差”恒等式严格成立、每笔尾差可解释
         BigDecimal feeAmount = Money.round2(rawFee);
-        // 费率为 0（或手续费被舍入为 0.00）时本笔实际不扣费：按“无手续费”两行凭证处理，
-        // 避免产生 0 金额分录行；对零费率显式请求仍视为内容上的无手续费支付
-        if (feeAmount.signum() == 0) {
-            return null;
-        }
+        // 只要费率实际生效（请求显式带费率，或本地默认费率启用），即使理论手续费按 HALF_UP
+        // 处理到分后正好是 0.00（零费率或费率极小），也必须保留费率/手续费 0.00/净额=总额快照：
+        // 账务上不产生 0 金额分录行（按两行凭证、净额=总额入账），但费率留痕不能丢，
+        // 之后单独查询必须能查到这笔实际用的费率、0.00 手续费与净额，而不是当成“没有手续费”。
         BigDecimal roundingAdjustment = feeAmount.subtract(rawFee);
         BigDecimal netAmount = gross.subtract(feeAmount).setScale(Money.SCALE);
         if (netAmount.signum() <= 0) {

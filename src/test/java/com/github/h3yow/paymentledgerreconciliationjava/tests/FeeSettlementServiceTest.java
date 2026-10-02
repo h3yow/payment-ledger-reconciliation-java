@@ -140,6 +140,30 @@ class FeeSettlementServiceTest {
     }
 
     @Test
+    @DisplayName("舍去尾差为负：理论手续费 0.004 舍去为 0.00，尾差 -0.004 精确可解释，费率快照保留")
+    void halfUpTruncationProducesNegativeAdjustment() {
+        // 4.00 * 1bp / 10000 = 0.0004 -> HALF_UP 到分 = 0.00（舍去），尾差 -0.0004
+        PaymentInstruction p = paymentService.submit(new PaymentCommand(
+                "FEE-NEG-ADJ", LedgerService.ACCT_PAYER, LedgerService.ACCT_PAYEE, "4.00",
+                1, LedgerService.ACCT_FEE));
+        FeeSettlement fs = p.getFeeSettlement();
+        assertNotNull(fs, "费率生效但手续费算成 0.00 时快照必须保留，不能当成没有手续费");
+        log.info("[判定依据] 理论={} 入账={} 尾差={}（舍去为负） 净额={}",
+                fs.rawFeeAmount(), fs.feeAmount(), fs.roundingAdjustment(), fs.netAmount());
+        assertEquals(0, fs.feeAmount().compareTo(new BigDecimal("0.00")));
+        assertEquals(0, fs.rawFeeAmount().compareTo(new BigDecimal("0.0004")));
+        assertEquals(0, fs.roundingAdjustment().compareTo(new BigDecimal("-0.0004")),
+                "HALF_UP 舍去时尾差为负：0.00 - 0.0004 = -0.0004");
+        assertEquals(0, fs.netAmount().compareTo(new BigDecimal("4.00")), "净额=总额");
+        // 恒等式含负尾差仍严格成立
+        assertEquals(0, fs.rawFeeAmount().add(fs.roundingAdjustment()).compareTo(fs.feeAmount()));
+        assertEquals(0, p.getAmount().amount().compareTo(fs.netAmount().add(fs.feeAmount())));
+        // 账务两行、手续费账户零发生额
+        assertEquals(2, entryRepository.findByVoucherNo("FEE-NEG-ADJ").size());
+        assertEquals(0, accountRepository.getByCode(LedgerService.ACCT_FEE).getBalance().signum());
+    }
+
+    @Test
     @DisplayName("非法情形在任何账务之前拒绝，原因可区分：费率非法/净额非正/手续费账户不存在/账户相同")
     void invalidFeeScenariosRejectedBeforeAnyPosting() {
         assertReasonContains(new PaymentCommand(

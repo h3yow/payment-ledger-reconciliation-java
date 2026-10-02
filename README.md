@@ -65,13 +65,26 @@
   - 只给手续费账户不给费率 → 参数非法拒绝。
 - **计算与尾差规则（固定、可解释）**：
   - 理论手续费 = `总额 × 费率bp / 10000`（`BigDecimal` 精确除法，可能带分位以外小数）；
-  - 入账手续费 = 理论手续费按 **`HALF_UP`（四舍五入）处理到分**；
-  - 尾差 = `入账手续费 − 理论手续费`（HALF_UP 下非负），保留**精确小数值**，
-    恒满足 `入账手续费 = 理论手续费 + 尾差`——每笔“分位以外的小数去了哪里”都能解释，
-    尾差实际由手续费收款方承担（进位多收/不足不补均体现在手续费账户发生额上）；
+  - 入账手续费 = 理论手续费按 **`HALF_UP`（四舍五入，逢五进位）处理到分**，固定规则不随金额大小变化；
+  - 尾差 = `入账手续费 − 理论手续费`，保留**精确小数值**，
+    恒满足 `入账手续费 = 理论手续费 + 尾差`——每笔“分位以外的小数去了哪里”都能解释。
+    尾差**可正可负**：
+    - 理论手续费分位后一位 `≥5` 进位时尾差为正（如理论 `0.035035` → 入账 `0.04`，尾差 `+0.004965`），
+      多收部分计入手续费收款账户；
+    - 分位后一位 `<5` 舍去时**尾差为负**（如理论 `0.004` → 入账 `0.00`，尾差 `-0.004`），
+      被舍去部分留在收款方净额里（净额按入账后的手续费计算，`净额 = 总额 − 入账手续费`），
+      手续费账户不补收；
   - 净额 = `总额 − 入账手续费`，固定 2 位小数，**必须为正**，否则在记账前拒绝。
-  - 费率为 0（或正费率极小、理论手续费 HALF_UP 后被舍入为 0.00）时本笔实际不扣费，
-    按无手续费两行凭证处理（指令上也不挂手续费快照），避免产生 0 金额分录行。
+- **费率生效但手续费算成 0.00（零费率或费率极小被舍入为 0.00）时的留痕规则**：
+  - 只要费率实际生效（请求显式带了 `feeRateBp`（含 `0`），或本地默认费率 `enabled=true`），
+    即使按费率算出的理论手续费 HALF_UP 到分后正好是 `0.00`（例如 `1.00 × 4bp = 0.0004 → 0.00`），
+    **实际费率、入账手续费 `0.00`、理论手续费、负尾差、扣费后净额（=总额）与手续费账户
+    仍以 `FeeSettlement` 快照随支付一起保留**，之后单独查这笔支付的手续费信息能查到费率与净额，
+    **不会因为手续费是 0 就被当成“没有手续费”而查无此记录**；
+  - 账务上按**净额 = 总额走两行凭证**入账（借付款方总额、贷收款方总额），
+    **不产生 0 金额分录行**、手续费账户无发生额（账本禁止借贷同时为零的分录行）；
+  - 这与“请求完全不带费率要素且本地配置关闭”的支付有本质区别：后者没有 `FeeSettlement`，
+    单独查询返回 `404 FEE_SETTLEMENT_NOT_FOUND`。
 - **入账（三行凭证，天然借贷平衡）**，以总额 100.00、费率 60bp（手续费 0.60、净额 99.40）为例：
 
   ```
@@ -88,7 +101,9 @@
   尾差、净额以 `FeeSettlement` 固化在支付指令上。之后无论怎样 `PUT /api/fees/config`
   调整费率，已受理支付的手续费/净额/分录/对账结论都不变。
 - **单独查询**：`GET /api/payments/{businessId}/fee-settlement` 返回该笔快照；
-  支付存在但不含手续费要素时返回 `404 FEE_SETTLEMENT_NOT_FOUND`（与“支付不存在”的 400 区分）。
+  费率生效但手续费为 `0.00` 的支付同样返回 `200`（快照中 `feeAmount=0.00`、`netAmount=总额`，
+  `roundingAdjustment` 为负尾差）；只有支付存在但受理时确实不含任何费率要素时
+  才返回 `404 FEE_SETTLEMENT_NOT_FOUND`（与“支付不存在”的 400 区分）。
 
 ---
 
@@ -122,6 +137,12 @@
 都只有一笔有效结果，赢家与输家观察到的**费率、手续费、净额、分录金额完全一致**；
 失败时账本全额冲正，不留半成品分录、不留半改余额。
 
+对“费率生效但手续费算成 0.00”的支付同样按此强度判定：**两次请求内容完全相同
+（含费率与手续费账户）才算重复请求**；哪怕两次算出来的手续费都是 `0.00`，
+只要费率不同（如 4bp vs 9bp 对 `1.00` 都是 `0.00`）、手续费账户不同或费率要素有无不同，
+一律判 `STATUS_CONFLICT`，而不是重复请求。并发提交同一业务标识时最终只有一笔有效结果，
+`0.00` 手续费、净额=总额、两行分录完全一致。
+
 `FAILED` 是终态：同一 `businessId` 相同请求得到 `DUPLICATE_REQUEST`（响应带 `existingStatus=FAILED`），
 篡改请求得到 `STATUS_CONFLICT`；需要重新支付请换用新的业务标识。
 
@@ -147,7 +168,9 @@
 - **净额与手续费分开识别、互不混淆**：判定顺序为 状态 → 总额 → 净额 → 手续费。
   净额先不符报 `NET_MISMATCH`（依据中仍列出双方手续费实际值）；净额一致、仅手续费不符报 `FEE_MISMATCH`。
   每条结论的 `basis` 分别写明本地/渠道的净额、手续费**实际值**，保证可解释。
-- **本地侧取数**：本地有手续费快照时取快照的净额/手续费；本地无手续费时净额=总额、手续费=0.00。
+- **本地侧取数**：本地有手续费快照时取快照的净额/手续费（**快照保留的手续费为 `0.00` 时
+  就按 `0.00` 与净额=总额参与核对**，渠道若报非零手续费会如实判 `FEE_MISMATCH`，
+  不会把这笔当成“没有手续费”而跳过）；本地无手续费快照时净额=总额、手续费=0.00。
   因此“本地无费、渠道报有费”会被如实识别为净额/手续费差异，不会静默当成一致。
 - **向后兼容（老批次行为不变）**：渠道记录不带 `fee/net` 时，只比对总额与状态，
   即使本地该笔带手续费也不会产生手续费类差异（依据中标注“按总额口径核对”）。
@@ -202,7 +225,16 @@ curl -s -X POST localhost:8080/api/payments -H 'Content-Type: application/json' 
 # 单独查这笔实际用的费率、手续费、净额与尾差
 curl -s localhost:8080/api/payments/B-1001/fee-settlement
 
-# 渠道数据带手续费与净额做分项对账
+# 带费率但手续费算成 0.00：1.00 × 4bp = 0.0004，HALF_UP 到分 = 0.00（尾差 -0.0004）
+# 费率/0.00 手续费/净额 1.00 仍随支付保留，查询返回 200（不是 404）
+curl -s -X POST localhost:8080/api/payments -H 'Content-Type: application/json' -d '{
+  "businessId":"B-1002","payerAccountNo":"1001","payeeAccountNo":"2001","amountText":"1.00",
+  "feeRateBp":4,"feeAccountNo":"3001"}'
+curl -s localhost:8080/api/payments/B-1002/fee-settlement
+# => {"feeRateBp":4,"feeAccountNo":"3001","feeAmount":0.00,"rawFeeAmount":0.0004,
+#     "roundingAdjustment":-0.0004,"netAmount":1.00}
+
+# 渠道数据带手续费与净额做分项对账（0.00 手续费按保留值核对）
 curl -s -X POST localhost:8080/api/reconciliations -H 'Content-Type: application/json' -d '{
   "batchId":"BATCH-1",
   "channelRecords":[{"businessId":"B-1001","amount":100.00,"status":"SUCCESS",
@@ -218,7 +250,7 @@ curl -s -X POST localhost:8080/api/reconciliations -H 'Content-Type: application
 # 离线编译
 mvn -o compile
 
-# 全量测试（30 个），无需任何外部服务
+# 全量测试（40 个），无需任何外部服务
 mvn -o test
 
 # 只跑关键场景
@@ -226,10 +258,11 @@ mvn -o test -Dtest=PaymentIdempotencyConcurrencyTest   # 20 线程并发重复�
 mvn -o test -Dtest=LedgerAtomicPostingTest             # 过账中途失败、全额冲正、零半成品
 mvn -o test -Dtest=ReconciliationDifferenceTest        # 五类对账差异、批次可复现/冲突
 mvn -o test -Dtest=PaymentApiIntegrationTest           # HTTP 端到端、三类错误码
-mvn -o test -Dtest=FeeSettlementServiceTest            # 手续费净额结算、尾差、费率快照、非法拒绝
+mvn -o test -Dtest=FeeSettlementServiceTest            # 手续费净额结算、尾差（含负尾差）、费率快照、非法拒绝
 mvn -o test -Dtest=FeeIdempotencyConcurrencyTest       # 手续费并发重复、篡改费率/账户区分、改费率不影响已受理
 mvn -o test -Dtest=FeeReconciliationDifferenceTest     # 净额/手续费差异分别识别、超精度拒绝、老请求兼容
-mvn -o test -Dtest=FeeApiIntegrationTest               # 手续费 HTTP 端到端、费率配置接口、分项对账
+mvn -o test -Dtest=FeeApiIntegrationTest               # 手续费 HTTP 端到端、0.00 手续费留痕 200、费率配置、分项对账
+mvn -o test -Dtest=ZeroFeeRateRetentionTest            # 0.00 手续费费率留痕/查询、重复与篡改区分、并发唯一、改费率不变、过账失败原子性、对账
 
 # 启动后用 curl 演练
 mvn -o spring-boot:run
@@ -244,10 +277,11 @@ mvn -o spring-boot:run
 | `LedgerAtomicPostingTest` | 故障钩子模拟借方已入账后失败：余额归零、零分录、FAILED 终态、同键不可再过账；不平衡凭证拒绝 |
 | `ReconciliationDifferenceTest` | 金额不符/状态不一致/本地缺失/渠道缺失/一致；批次复现与冲突；渠道重复单/非法输入拒绝；空渠道范围 |
 | `PaymentApiIntegrationTest` | HTTP 端到端、三类错误码、余额守恒、对账批次取回 |
-| `FeeSettlementServiceTest` | 三账户分账与平衡、费率快照单独可查、HALF_UP 尾差与恒等式、费率/净额/账户非法拒绝、改配置后快照不变、配置驱动开关 |
+| `FeeSettlementServiceTest` | 三账户分账与平衡、费率快照单独可查、HALF_UP 尾差与恒等式（**新增舍去为负尾差 -0.0004 且快照保留**）、费率/净额/账户非法拒绝、改配置后快照不变、配置驱动开关 |
 | `FeeIdempotencyConcurrencyTest` | 带手续费 20 线程并发仅 1 笔且结果唯一、串行重复 DUPLICATE、篡改费率/手续费账户 CONFLICT、改费率后重放仍按受理快照 |
 | `FeeReconciliationDifferenceTest` | 三要素一致 MATCHED、净额/手续费差异分别识别且依据列实际值、本地无费渠道有费、老请求总额口径兼容、三类超精度金额拒绝、历史批次不被覆盖 |
-| `FeeApiIntegrationTest` | 手续费 HTTP 受理/三账户守恒/单独查询/404、费率配置 GET/PUT、HTTP 分项对账 NET_MISMATCH/FEE_MISMATCH/MATCHED |
+| `FeeApiIntegrationTest` | 手续费 HTTP 受理/三账户守恒/单独查询/404、**0.00 手续费快照 HTTP 200 可查且两行分录无手续费账户**、费率配置 GET/PUT、HTTP 分项对账 NET_MISMATCH/FEE_MISMATCH/MATCHED |
+| `ZeroFeeRateRetentionTest` | **显式费率（含 0bp）与本地默认费率算得 0.00 手续费时费率/0.00/净额留痕可查；两行凭证无 0 金额行、三账户守恒；同内容 DUPLICATE 与费率/账户篡改（手续费同为 0.00）CONFLICT 区分；20 线程并发仅 1 笔；改费率配置后快照/分录/对账不变；过账中途失败全额冲正、零分录、FAILED 快照仍保留；对账 MATCHED/NET_MISMATCH/FEE_MISMATCH 与老口径兼容** |
 
 ## 6. 代码结构
 
