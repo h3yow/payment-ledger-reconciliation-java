@@ -17,7 +17,11 @@ public final class PaymentInstruction {
     private final String payeeAccountNo;
     private final Money amount;
     private final Instant createdAt;
-    /** 手续费结算快照；无手续费的支付为 null。受理当时锁定，永不随费率配置变化。 */
+    /**
+     * 手续费结算快照；费率从未生效（无手续费要素）的支付为 null。
+     * 费率生效但入账手续费为 0.00 时快照仍然存在（费率/0.00 手续费/净额留痕）。
+     * 受理当时锁定，永不随费率配置变化。
+     */
     private final FeeSettlement feeSettlement;
     private PaymentStatus status;
     private Instant finishedAt;

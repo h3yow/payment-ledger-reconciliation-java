@@ -35,7 +35,9 @@ import java.util.concurrent.ConcurrentMap;
  *   <li>已存在分支按内容区分：内容完全相同（含费率/手续费账户）→ {@link DuplicateRequestException}，
  *       内容不同 → {@link ConflictException}；二者错误原因可区分；</li>
  *   <li>赢家紧接着调用 {@link LedgerService#postVoucher} 过账：
- *       无手续费两行凭证；带手续费三行凭证（借付款方总额；贷收款方净额；贷手续费账户手续费），
+ *       费率未生效时两行凭证；入账手续费为正时三行凭证（借付款方总额；贷收款方净额；贷手续费账户手续费）；
+ *       费率生效但入账手续费为 0.00 时按两行凭证（借付款方总额；贷收款方净额=总额），
+ *       不产生 0 金额分录行，但费率/0.00 手续费/净额快照仍随指令保留；
  *       成功标记 POSTED；失败（含中途故障）由账本保证余额全额冲正、无分录残留，
  *       指令标记 FAILED（终态），同一 businessId 不可再提，需换新业务键。</li>
  * </ol>
@@ -101,16 +103,26 @@ public class PaymentService {
             }
 
             // 3. 赢家过账（凭证号复用 businessId，天然一一对应）
-            List<LedgerService.VoucherLine> lines = fee == null
-                    ? List.of(
-                            new LedgerService.VoucherLine(payer, amount.amount(), BigDecimal.ZERO),
-                            new LedgerService.VoucherLine(payee, BigDecimal.ZERO, amount.amount()))
-                    : List.of(
-                            new LedgerService.VoucherLine(payer, amount.amount(), BigDecimal.ZERO),
-                            new LedgerService.VoucherLine(payee, BigDecimal.ZERO,
-                                    fee.settlement().netAmount()),
-                            new LedgerService.VoucherLine(fee.feeAccountNo(), BigDecimal.ZERO,
-                                    fee.settlement().feeAmount()));
+            // 费率生效但入账手续费为 0.00 时，账务等价于无手续费：只出两行凭证
+            // （不产生 0 金额的手续费分录行），净额=总额；但费率快照仍挂在指令上留痕。
+            List<LedgerService.VoucherLine> lines;
+            if (fee == null) {
+                lines = List.of(
+                        new LedgerService.VoucherLine(payer, amount.amount(), BigDecimal.ZERO),
+                        new LedgerService.VoucherLine(payee, BigDecimal.ZERO, amount.amount()));
+            } else if (fee.settlement().feeAmount().signum() == 0) {
+                lines = List.of(
+                        new LedgerService.VoucherLine(payer, amount.amount(), BigDecimal.ZERO),
+                        new LedgerService.VoucherLine(payee, BigDecimal.ZERO,
+                                fee.settlement().netAmount()));
+            } else {
+                lines = List.of(
+                        new LedgerService.VoucherLine(payer, amount.amount(), BigDecimal.ZERO),
+                        new LedgerService.VoucherLine(payee, BigDecimal.ZERO,
+                                fee.settlement().netAmount()),
+                        new LedgerService.VoucherLine(fee.feeAccountNo(), BigDecimal.ZERO,
+                                fee.settlement().feeAmount()));
+            }
             try {
                 ledgerService.postVoucher(businessId, lines, "支付过账 " + businessId);
                 instruction.markPosted(Instant.now());
@@ -179,14 +191,10 @@ public class PaymentService {
         BigDecimal rawFee = gross.multiply(BigDecimal.valueOf(effectiveRateBp))
                 .divide(BigDecimal.valueOf(10_000L), java.math.MathContext.DECIMAL128)
                 .stripTrailingZeros();
-        // 固定分位规则：HALF_UP 处理到分；尾差 = 入账手续费 − 理论手续费（HALF_UP 下非负），
-        // 尾差保留精确小数值，使“入账手续费 = 理论手续费 + 尾差”恒等式严格成立、每笔尾差可解释
+        // 固定分位规则：HALF_UP 处理到分；尾差 = 入账手续费 − 理论手续费，
+        // 舍去时尾差为负、进位时为正、整除时为 0；尾差保留精确小数值，
+        // 使“入账手续费 = 理论手续费 + 尾差”恒等式严格成立、每笔尾差（含舍去的负尾差）可解释
         BigDecimal feeAmount = Money.round2(rawFee);
-        // 费率为 0（或手续费被舍入为 0.00）时本笔实际不扣费：按“无手续费”两行凭证处理，
-        // 避免产生 0 金额分录行；对零费率显式请求仍视为内容上的无手续费支付
-        if (feeAmount.signum() == 0) {
-            return null;
-        }
         BigDecimal roundingAdjustment = feeAmount.subtract(rawFee);
         BigDecimal netAmount = gross.subtract(feeAmount).setScale(Money.SCALE);
         if (netAmount.signum() <= 0) {
@@ -195,6 +203,10 @@ public class PaymentService {
                     gross.toPlainString(), effectiveRateBp, rawFee.toPlainString(),
                     netAmount.toPlainString()));
         }
+        // 只要费率要素实际生效（请求显式带费率，或本地默认配置启用），即使入账手续费被
+        // HALF_UP 处理为 0.00（费率为 0，或费率极小、总额极小导致），也照样固化快照：
+        // 实际费率、0.00 手续费、精确尾差与净额（=总额）随支付永久留痕，单独查询可查；
+        // 账务侧则由调用方按净额=总额的两行凭证入账，不产生 0 金额分录行。
         // 理论手续费与尾差保留精确小数值（BigDecimal 精确），用于解释每一笔尾差去了哪里
         FeeSettlement settlement = new FeeSettlement(
                 effectiveRateBp, feeAccountNo, feeAmount, rawFee, roundingAdjustment, netAmount);
@@ -256,7 +268,11 @@ public class PaymentService {
                 .orElseThrow(() -> new InvalidParameterException("支付指令不存在: " + businessId));
     }
 
-    /** 单独查某笔支付的手续费结算快照（实际费率/手续费/净额/尾差）；无手续费要素时返回 null。 */
+    /**
+     * 单独查某笔支付的手续费结算快照（实际费率/手续费/净额/尾差）。
+     * 只要费率要素实际生效就有快照——即使入账手续费为 0.00（费率为 0 或极小费率被舍入为 0），
+     * 仍能查到实际费率、0.00 手续费与等于总额的净额；只有费率从未生效（无手续费要素）时才为 null。
+     */
     public FeeSettlement getFeeSettlement(String businessId) {
         return getByBusinessId(businessId).getFeeSettlement();
     }
